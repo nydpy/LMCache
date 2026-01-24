@@ -752,3 +752,32 @@ def load_engine_config_with_overrides(
         config_file_path=config_file_path,
         overrides=overrides,
     )
+
+
+def _validate_and_set_config_value(
+    config: LMCacheEngineConfig,
+    key: str,
+    value: Any,
+) -> bool:
+    """
+    Validate and set a config value dynamically.
+
+    Args:
+        config: The LMCacheEngineConfig instance to modify
+        key: The configuration key to set
+        value: The value to set
+
+    Returns:
+        True if the value was successfully set, False otherwise
+    """
+    # Check if the key exists in the config
+    if not hasattr(config, key):
+        logger.warning("Config key %s not found in LMCacheEngineConfig", key)
+        return False
+
+    try:
+        setattr(config, key, value)
+        return True
+    except Exception as e:
+        logger.warning("Failed to set config %s: %s", key, e)
+        return False

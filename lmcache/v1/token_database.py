@@ -301,10 +301,11 @@ class ChunkedTokenDatabase(TokenDatabase):
         self,
         token_chunks: Iterable[Union[torch.Tensor, List[int]]],
     ) -> Iterable[int]:
-        prefix_hash = self._get_init_hash()
+        # MODIFIED: Content-only hashing (no prefix chain)
+        # This allows selective block loading without requiring all previous blocks
         for token_chunk in token_chunks:
-            prefix_hash = self._hash_tokens(token_chunk, prefix_hash)
-            yield prefix_hash
+            chunk_hash = self._hash_tokens(token_chunk)  # No prefix dependency!
+            yield chunk_hash
 
     @_lmcache_nvtx_annotate
     def process_tokens(

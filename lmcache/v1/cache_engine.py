@@ -688,14 +688,23 @@ class LMCacheEngine:
     @torch.inference_mode()
     def retrieve(
         self,
-        tokens: Union[torch.Tensor, list[int]],
+        tokens: Optional[Union[torch.Tensor, list[int]]] = None,
+        hashes: Optional[List[int]] = None,
+        offsets: Optional[List[int]] = None,
         mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Retrieve the KV caches from the cache engine. And put the retrieved
         KV cache to the serving engine via the GPU connector.
 
-        :param torch.Tensor tokens: The tokens of the corresponding KV caches.
+        :param Optional[torch.Tensor] tokens: The tokens of the corresponding KV caches.
+
+        :param Optional[List[int]] hashes: The hashes/UUIDs to retrieve. If provided,
+            bypasses token-based lookup and retrieves blocks by hash directly.
+            This enables selective loading of specific blocks.
+
+        :param Optional[List[int]] offsets: The number of tokens in each block.
+            Required when using hashes.
 
         :param Optional[torch.Tensor] mask: The mask for the tokens. Should
             have the same length as tokens. And the mask should ALWAYS be like
@@ -714,9 +723,17 @@ class LMCacheEngine:
             multiple of the chunk size.
         """
         # Health check: block operation if LMCache is unhealthy
+        # Determine total tokens from either tokens or hashes+offsets
+        if tokens is not None:
+            total_tokens = len(tokens)
+        elif hashes is not None and offsets is not None:
+            total_tokens = sum(offsets)
+        else:
+            raise ValueError("Either 'tokens' or 'hashes'+'offsets' must be provided")
+
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping retrieve operation")
-            return torch.zeros(len(tokens), dtype=torch.bool)
+            return torch.zeros(total_tokens, dtype=torch.bool)
 
         assert self.gpu_connector is not None, (
             "gpu_connector is required for retrieve operation"
@@ -728,7 +745,7 @@ class LMCacheEngine:
         if mask is not None:
             num_required_tokens = torch.sum(mask).item()
         else:
-            num_required_tokens = len(tokens)
+            num_required_tokens = total_tokens
 
         # KVCache Check logging
         self._log_kvcache_for_check(
@@ -740,7 +757,7 @@ class LMCacheEngine:
 
         monitor_req_id = self.stats_monitor.on_retrieve_request(num_required_tokens)
 
-        ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+        ret_mask = torch.zeros(total_tokens, dtype=torch.bool, device="cpu")
 
         reordered_chunks: List[ProcessedChunk] = []
         if not self._is_passive():
@@ -749,6 +766,8 @@ class LMCacheEngine:
                     tokens,
                     mask,
                     ret_mask,
+                    hashes=hashes,
+                    offsets=offsets,
                     **kwargs,
                 )
             else:
@@ -756,6 +775,8 @@ class LMCacheEngine:
                     tokens,
                     mask,
                     ret_mask,
+                    hashes=hashes,
+                    offsets=offsets,
                     **kwargs,
                 )
         if self.save_only_first_rank:
@@ -1087,6 +1108,87 @@ class LMCacheEngine:
             # vllm lookup sets pin to True
             if pin:
                 # touch_cache is tightly coupled with batched_contains
+                self.storage_manager.touch_cache()
+
+    @_lmcache_nvtx_annotate
+    def lookup_selective(
+        self,
+        tokens: Optional[Union[torch.Tensor, List[int]]] = None,
+        hashes: Optional[List[int]] = None,
+        offsets: Optional[List[int]] = None,
+        search_range: Optional[List[str]] = None,
+        lookup_id: Optional[str] = None,
+        pin: bool = False,
+        request_configs: Optional[dict] = None,
+    ) -> Tuple[int, List[int], List[int]]:
+        """
+        SELECTIVE LOADING: Check which blocks exist (not just prefix).
+        Returns all available blocks, even if there are gaps.
+
+        :return: Tuple of (total_tokens, hit_hashes, hit_offsets)
+            - total_tokens: sum of tokens in hit blocks
+            - hit_hashes: list of hashes for blocks that exist
+            - hit_offsets: list of token counts for each hit block
+        """
+        if not self.is_healthy():
+            logger.warning("LMCache is unhealthy, skipping lookup operation")
+            return 0, [], []
+
+        assert self.storage_manager is not None
+
+        if tokens is not None:
+            lookup_request_id = self.stats_monitor.on_lookup_request(len(tokens))
+        else:
+            assert offsets is not None
+            assert hashes is not None
+            lookup_request_id = self.stats_monitor.on_lookup_request(sum(offsets))
+
+        total_tokens = 0
+        hit_hashes: List[int] = []
+        hit_offsets: List[int] = []
+
+        try:
+            chunk_info_iterator = self.token_database.process_tokens(
+                tokens=tokens,
+                hashes=hashes,
+                offsets=offsets,
+                request_configs=request_configs,
+                make_key=False,  # Get hash directly
+            )
+
+            chunk_info_list = list(chunk_info_iterator)
+
+            # Build keys for batched_contains
+            keys = []
+            for start, end, chunk_hash in chunk_info_list:
+                key = self.token_database._make_key_by_hash(chunk_hash, request_configs)
+                keys.append(key)
+
+            # Check which blocks exist
+            _, block_mapping = self.storage_manager.batched_contains(
+                keys, search_range, pin
+            )
+
+            if pin and block_mapping:
+                assert lookup_id is not None
+                self.lookup_pins[lookup_id] = block_mapping
+
+            # Collect ALL hits (not just prefix)
+            hit_keys = set()
+            for location, loc_keys in block_mapping.items():
+                hit_keys.update(loc_keys)
+
+            for idx, (start, end, chunk_hash) in enumerate(chunk_info_list):
+                if keys[idx] in hit_keys:
+                    total_tokens += (end - start)
+                    hit_hashes.append(chunk_hash)
+                    hit_offsets.append(end - start)
+
+            return total_tokens, hit_hashes, hit_offsets
+
+        finally:
+            self.stats_monitor.on_lookup_finished(lookup_request_id, total_tokens)
+            if pin:
                 self.storage_manager.touch_cache()
 
     @_lmcache_nvtx_annotate
@@ -1447,6 +1549,8 @@ class LMCacheEngine:
         tokens,
         mask,
         ret_mask,
+        hashes=None,
+        offsets=None,
         **kwargs,
     ) -> ProcessTokensInternalResult:
         """
@@ -1456,6 +1560,8 @@ class LMCacheEngine:
             tokens: Input tokens to process
             mask: Mask indicating valid token positions
             ret_mask: Output mask updated with cache hit positions
+            hashes: Optional list of hashes/UUIDs for direct block lookup
+            offsets: Optional list of token counts per block (required with hashes)
             **kwargs: Additional keyword arguments
         """
         assert "req_id" in kwargs, "req_id is required for async loading"
@@ -1485,15 +1591,17 @@ class LMCacheEngine:
         used_keys: set[CacheEngineKey] = set()
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
+            hashes=hashes,
+            offsets=offsets,
             mask=mask,
             request_configs=request_configs,
         ):
             assert isinstance(key, CacheEngineKey)
             memory_obj = memory_obj_map.get(key)
             if memory_obj is None:
-                # returned chunks are expected to be contiguous.
-                # break at the first missing chunk.
-                break
+                # MODIFIED: Allow selective loading - skip missing chunks
+                # instead of breaking. This enables loading blocks 1,3,5 even if 2,4 missing
+                continue
             chunks.append((key, memory_obj, start, end))
             tot_kv_size += memory_obj.get_size()
             ret_mask[start:end] = True
@@ -1511,6 +1619,8 @@ class LMCacheEngine:
         tokens,
         mask,
         ret_mask,
+        hashes=None,
+        offsets=None,
         **kwargs,
     ) -> ProcessTokensInternalResult:
         """Process tokens and populate the reordered lists.
@@ -1521,6 +1631,8 @@ class LMCacheEngine:
             tokens: Input tokens to process
             mask: Mask indicating valid token positions
             ret_mask: Output mask updated with cache hit positions
+            hashes: Optional list of hashes/UUIDs for direct block lookup
+            offsets: Optional list of token counts per block (required with hashes)
             **kwargs: Additional keyword arguments
         """
         assert self.storage_manager is not None
@@ -1534,6 +1646,8 @@ class LMCacheEngine:
         chunk_infos = []
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
+            hashes=hashes,
+            offsets=offsets,
             mask=mask,
             request_configs=request_configs,
         ):
@@ -1574,14 +1688,15 @@ class LMCacheEngine:
                 tot_kv_size += memory_obj.get_size()
                 ret_mask[start:end] = True
 
+        # MODIFIED: Allow selective loading - don't invalidate all blocks after a miss
+        # Old behavior: if block 2 missing, blocks 3,4,5 are dropped
+        # New behavior: if block 2 missing, blocks 3,4,5 still loaded if they exist
         if last_failed_block_start is not None:
-            ret_mask[last_failed_block_start:] = False
-
-            reordered_chunks = [
-                (key, memory_obj, start, end)
-                for key, memory_obj, start, end in reordered_chunks
-                if end < last_failed_block_start
-            ]
+            # Just log the miss, don't invalidate following blocks
+            logger.info(
+                "Block miss at position %d, continuing with available blocks",
+                last_failed_block_start
+            )
         return reordered_chunks, tot_kv_size
 
     def _broadcast_or_receive_memory_objs(
