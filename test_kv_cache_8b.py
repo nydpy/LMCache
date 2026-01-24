@@ -1,40 +1,22 @@
 #!/usr/bin/env python3
 """
-Large model (8B) KV cache test.
+Large model (8B) KV cache test with 4-bit quantization.
 
-Tests KV cache performance with Qwen2-7B-Instruct (8B-class model).
-Requires GPU with 16GB+ VRAM (or use AWQ quantized version).
+Tests KV cache performance with Qwen2-7B-Instruct-AWQ (4-bit quantized).
+Works on T4 GPU (16GB VRAM).
 
-Usage: python test_kv_cache_8b.py [--model MODEL_NAME]
-
-Models:
-  - Qwen/Qwen2-7B-Instruct (default, needs ~16GB VRAM)
-  - Qwen/Qwen2-7B-Instruct-AWQ (quantized, needs ~8GB VRAM)
-  - Qwen/Qwen2.5-7B-Instruct (newer version)
+Usage: python test_kv_cache_8b.py
 """
 
 import os
-import sys
 import time
-import argparse
 
 os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
 
 from vllm import LLM, SamplingParams
 
-# Parse arguments
-parser = argparse.ArgumentParser()
-parser.add_argument("--model", default="Qwen/Qwen2-7B-Instruct", help="Model to use")
-parser.add_argument("--quantized", action="store_true", help="Use AWQ quantized model")
-parser.add_argument("--multiplier", type=int, default=8, help="Document multiplier for longer context")
-args = parser.parse_args()
-
-model_name = args.model
-if args.quantized:
-    model_name = "Qwen/Qwen2-7B-Instruct-AWQ"
-
 print("="*60)
-print("8B MODEL KV CACHE TEST")
+print("8B MODEL KV CACHE TEST (4-bit AWQ)")
 print("="*60)
 
 # Base document chunk
@@ -116,7 +98,7 @@ Long-term (5 years):
 """
 
 # Multiply to get longer context
-MULTIPLIER = args.multiplier
+MULTIPLIER = 6
 long_document = "You are a helpful AI assistant. Below is detailed information about a user.\n"
 for i in range(MULTIPLIER):
     long_document += f"\n--- SECTION {i+1} ---\n"
@@ -127,31 +109,22 @@ long_document += "\n\n=== END OF DOCUMENT ===\n\nBased on ALL sections above, an
 # Count approximate tokens
 approx_tokens = len(long_document.split()) * 1.3
 print(f"\nDocument size: ~{int(approx_tokens)} tokens ({MULTIPLIER} sections)")
-print(f"Model: {model_name}")
 
-print("\nLoading model (this may take a few minutes for 8B)...")
+# Use 4-bit AWQ quantized model for T4
+model_name = "Qwen/Qwen2-7B-Instruct-AWQ"
+print(f"Model: {model_name} (4-bit quantized)")
+
+print("\nLoading model...")
 start_load = time.time()
 
-try:
-    llm = LLM(
-        model=model_name,
-        max_model_len=16384,
-        gpu_memory_utilization=0.85,
-        enable_prefix_caching=True,
-        trust_remote_code=True,
-    )
-except Exception as e:
-    print(f"\nError loading model: {e}")
-    print("\nTrying with quantized model...")
-    model_name = "Qwen/Qwen2-7B-Instruct-AWQ"
-    llm = LLM(
-        model=model_name,
-        max_model_len=16384,
-        gpu_memory_utilization=0.85,
-        enable_prefix_caching=True,
-        quantization="awq",
-        trust_remote_code=True,
-    )
+llm = LLM(
+    model=model_name,
+    max_model_len=8192,
+    gpu_memory_utilization=0.85,
+    enable_prefix_caching=True,
+    quantization="awq",
+    trust_remote_code=True,
+)
 
 load_time = time.time() - start_load
 print(f"Model loaded in {load_time:.1f}s\n")
@@ -247,16 +220,17 @@ print("\n" + "="*60)
 print("COMPARISON: 0.5B vs 7B")
 print("="*60)
 print(f"""
-Expected speedup comparison:
+Results comparison:
 
-                    Qwen2-0.5B    Qwen2-7B (this test)
-                    (24 layers)   (28 layers, more heads)
+                    Qwen2-0.5B       Qwen2-7B-AWQ
+                    (24 layers)      (28 layers, 4-bit)
 ------------------------------------------------------------
-~2500 tokens        4x speedup    {speedup_r3:.1f}x speedup
-Cache hit time      ~21ms         ~{avg_r3:.0f}ms
+~2600 tokens
+  Cache miss        84ms             {avg_r1:.0f}ms
+  Cache hit         21ms             {avg_r3:.0f}ms
+  Speedup           4x               {speedup_r3:.1f}x
 
 Larger models benefit MORE from KV caching because:
 - More layers = more attention computation saved
 - More heads = more KV to cache/reuse
-- Quadratic attention cost grows faster with model size
 """)
