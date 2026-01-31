@@ -45,12 +45,13 @@ completions_old = [
     ("User: Where do I work?\nAssistant: You work at", "Google"),
 ]
 
-print("\nLoading model (Qwen3-4B-Instruct-2507)...")
+print("\nLoading model (Qwen3-4B-Instruct-2507-AWQ)...")
 llm = LLM(
-    model="Qwen/Qwen3-4B-Instruct-2507",
+    model="cpatonn/Qwen3-4B-Instruct-2507-AWQ-4bit",
     max_model_len=4096,
     gpu_memory_utilization=0.85,
     enable_prefix_caching=True,
+    quantization="awq",
 )
 print("Model ready!\n")
 
