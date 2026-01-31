@@ -114,11 +114,11 @@ questions_about_old = [
     ("What is my favorite food?", "pizza"),
 ]
 
-print("Loading model...")
+print("Loading model (Qwen3-4B-Instruct-2507)...")
 llm = LLM(
-    model="Qwen/Qwen2-0.5B",
+    model="Qwen/Qwen3-4B-Instruct-2507",
     max_model_len=4096,
-    gpu_memory_utilization=0.5,
+    gpu_memory_utilization=0.85,
     enable_prefix_caching=True,
 )
 print("Model ready!\n")
