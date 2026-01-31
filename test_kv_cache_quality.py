@@ -74,7 +74,7 @@ print(f"\nContext size: ~{len(context.split())} words")
 
 print("\nLoading model (Qwen3-4B-Instruct-2507-AWQ)...")
 llm = LLM(
-    model="cpatonn/Qwen3-4B-Instruct-2507-AWQ-4bit",
+    model="cyankiwi/Qwen3-4B-Instruct-2507-AWQ-4bit",
     max_model_len=4096,
     gpu_memory_utilization=0.85,
     enable_prefix_caching=True,
