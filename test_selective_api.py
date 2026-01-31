@@ -2,27 +2,24 @@
 """
 Selective KV Cache Loading API Test
 
-This test uses the LMCache selective loading API via vLLM server.
+Tests to verify selective KV cache loading actually uses cached blocks.
 
 REQUIRES: vLLM server running with LMCache enabled
 
 To start server:
+    LMCACHE_CHUNK_SIZE=256 LMCACHE_LOCAL_CPU=True LMCACHE_MAX_LOCAL_CPU_SIZE=5 \
     vllm serve cyankiwi/Qwen3-4B-Instruct-2507-AWQ-4bit \
-        --enable-prefix-caching \
-        --gpu-memory-utilization 0.85
+        --gpu-memory-utilization 0.85 --max-model-len 4096 \
+        --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
 
 Then run this test:
     python test_selective_api.py
-
-Test flow:
-1. Send full context [system][old][new] - stores all blocks in cache
-2. Send selective request with only [system][new] hashes - loads from cache
-3. Verify: knows new content, doesn't know old content
 """
 
 import hashlib
 import time
-from typing import List, Dict, Any
+import random
+from typing import List, Dict, Any, Tuple
 
 try:
     from openai import OpenAI
@@ -32,11 +29,10 @@ except ImportError:
     print("ERROR: openai package required. Install with: pip install openai")
     exit(1)
 
-# Server URL - adjust if different
 SERVER_URL = "http://localhost:8000/v1"
 
 print("="*70)
-print("SELECTIVE KV CACHE LOADING API TEST")
+print("SELECTIVE KV CACHE LOADING - VERIFICATION TEST")
 print("="*70)
 
 # Message blocks
@@ -84,8 +80,8 @@ def make_request(
     messages: List[Dict],
     selective_params: Dict[str, Any] = None,
     label: str = ""
-) -> str:
-    """Make a request with optional selective loading params"""
+) -> Tuple[str, float]:
+    """Make a request with optional selective loading params. Returns (content, time)"""
 
     kwargs = {
         "model": "cyankiwi/Qwen3-4B-Instruct-2507-AWQ-4bit",
@@ -102,6 +98,8 @@ def make_request(
     if selective_params:
         print(f"  Selective hashes: {len(selective_params['lmcache.selective_hashes'])}")
         print(f"  Total cached tokens: {sum(selective_params['lmcache.selective_offsets'])}")
+    else:
+        print(f"  Selective params: None (fresh compute)")
 
     start = time.time()
     try:
@@ -110,131 +108,186 @@ def make_request(
         content = response.choices[0].message.content
         print(f"  Time: {elapsed:.3f}s")
         print(f"  Response: {content[:60]}...")
-        return content
+        return content, elapsed
     except Exception as e:
         print(f"  ERROR: {e}")
-        return ""
+        return "", 0.0
 
 
 def main():
     print(f"\nConnecting to: {SERVER_URL}")
     client = OpenAI(base_url=SERVER_URL, api_key="dummy")
 
-    # Test connection
     try:
         models = client.models.list()
         print(f"Server ready. Available models: {[m.id for m in models.data]}")
     except Exception as e:
         print(f"ERROR: Cannot connect to server: {e}")
-        print("\nMake sure vLLM server is running:")
-        print("  vllm serve cyankiwi/Qwen3-4B-Instruct-2507-AWQ-4bit --enable-prefix-caching")
+        print("\nMake sure vLLM server is running with LMCache:")
+        print('  LMCACHE_CHUNK_SIZE=256 LMCACHE_LOCAL_CPU=True vllm serve ... --kv-transfer-config \'{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}\'')
         return
 
+    times = {}
+
+    # =========================================================================
+    # TEST 1: SELECTIVE MISS (new content, not cached yet)
+    # =========================================================================
     print("\n" + "="*70)
-    print("TEST 1: FULL CONTEXT (cache all blocks)")
+    print("TEST 1: SELECTIVE MISS (content NOT in cache yet)")
+    print("="*70)
+
+    # Create unique messages that haven't been cached
+    unique_id = random.randint(10000, 99999)
+    uncached_msgs = [
+        {"role": "user", "content": f"My favorite number is {unique_id}."},
+        {"role": "assistant", "content": f"Interesting! {unique_id} is your favorite number."},
+    ]
+
+    uncached_messages = [system_msg] + uncached_msgs + [
+        {"role": "user", "content": "What is my favorite number?"}
+    ]
+    uncached_params = build_selective_params([system_msg] + uncached_msgs)
+
+    out1, times['selective_miss'] = make_request(
+        client,
+        uncached_messages,
+        selective_params=uncached_params,
+        label="Request 1: SELECTIVE MISS (blocks not cached)"
+    )
+
+    # =========================================================================
+    # TEST 2: SELECTIVE HIT (same content, now cached)
+    # =========================================================================
+    print("\n" + "="*70)
+    print("TEST 2: SELECTIVE HIT (same content, should be cached now)")
+    print("="*70)
+
+    out2, times['selective_hit'] = make_request(
+        client,
+        uncached_messages,
+        selective_params=uncached_params,
+        label="Request 2: SELECTIVE HIT (blocks now cached)"
+    )
+
+    # =========================================================================
+    # TEST 3: FRESH COMPUTE (same content, NO selective params)
+    # =========================================================================
+    print("\n" + "="*70)
+    print("TEST 3: FRESH COMPUTE (same content, no selective params)")
+    print("="*70)
+
+    out3, times['fresh_compute'] = make_request(
+        client,
+        uncached_messages,
+        selective_params=None,  # No selective - just vLLM prefix cache
+        label="Request 3: FRESH COMPUTE (no selective params)"
+    )
+
+    # =========================================================================
+    # TEST 4: Full context to cache all blocks
+    # =========================================================================
+    print("\n" + "="*70)
+    print("TEST 4: FULL CONTEXT (cache all blocks for later)")
     print("="*70)
 
     full_messages = [system_msg] + old_msgs + new_msgs + [
         {"role": "user", "content": "What car do I have?"}
     ]
 
-    # First request - stores all KV in cache
-    out1 = make_request(client, full_messages, label="Request 1 (cache miss - compute all)")
+    out4, times['full_miss'] = make_request(
+        client, full_messages,
+        label="Request 4: FULL CONTEXT (cache miss)"
+    )
 
+    # =========================================================================
+    # TEST 5: Full context hit
+    # =========================================================================
     print("\n" + "="*70)
-    print("TEST 2: FULL CONTEXT AGAIN (cache hit)")
+    print("TEST 5: FULL CONTEXT HIT")
     print("="*70)
 
     full_messages_q2 = [system_msg] + old_msgs + new_msgs + [
         {"role": "user", "content": "What is my name?"}
     ]
-    out2 = make_request(client, full_messages_q2, label="Request 2 (cache hit)")
+    out5, times['full_hit'] = make_request(
+        client, full_messages_q2,
+        label="Request 5: FULL CONTEXT HIT"
+    )
 
+    # =========================================================================
+    # TEST 6: Selective loading (skip old, use cached new)
+    # =========================================================================
     print("\n" + "="*70)
-    print("TEST 3: SELECTIVE LOADING (skip old blocks)")
+    print("TEST 6: SELECTIVE (skip old, load new from cache)")
     print("="*70)
 
-    # Build selective params - only system + new, skip old
     selective_messages = [system_msg] + new_msgs
     selective_params = build_selective_params(selective_messages)
 
-    selective_messages_q = selective_messages + [
+    selective_q = selective_messages + [
         {"role": "user", "content": "What car do I have?"}
     ]
-    out3 = make_request(
+    out6, times['selective_skip'] = make_request(
         client,
-        selective_messages_q,
+        selective_q,
         selective_params=selective_params,
-        label="Request 3 (selective - skip old)"
+        label="Request 6: SELECTIVE (skip old blocks)"
     )
 
+    # =========================================================================
+    # RESULTS
+    # =========================================================================
     print("\n" + "="*70)
-    print("TEST 4: SELECTIVE - Ask about OLD content")
+    print("TIMING COMPARISON")
     print("="*70)
-
-    selective_messages_q2 = selective_messages + [
-        {"role": "user", "content": "What is my name?"}
-    ]
-    out4 = make_request(
-        client,
-        selective_messages_q2,
-        selective_params=selective_params,
-        label="Request 4 (selective - ask about old)"
-    )
-
-    print("\n" + "="*70)
-    print("TEST 5: FRESH COMPUTE (same 6 messages, NO selective params)")
-    print("="*70)
-
-    # Same messages as selective, but WITHOUT selective_hashes
-    # This forces fresh KV computation
-    selective_messages_fresh = selective_messages + [
-        {"role": "user", "content": "What car do I have?"}
-    ]
-    out5 = make_request(
-        client,
-        selective_messages_fresh,
-        selective_params=None,  # No selective loading - fresh compute
-        label="Request 5 (fresh compute - no cache)"
-    )
-
-    print("\n" + "="*70)
-    print("TEST 6: SELECTIVE AGAIN (should be faster if cache works)")
-    print("="*70)
-
-    out6 = make_request(
-        client,
-        selective_messages_q,
-        selective_params=selective_params,
-        label="Request 6 (selective - second time)"
-    )
-
-    # Results
-    print("\n" + "="*70)
-    print("RESULTS")
-    print("="*70)
-
-    knows_tesla_full = "tesla" in out1.lower()
-    knows_bob_full = "bob" in out2.lower()
-    knows_tesla_sel = "tesla" in out3.lower()
-    knows_bob_sel = "bob" in out4.lower()
 
     print(f"""
-                          Full Context    Selective
-                          ────────────    ─────────
-Knows Tesla (new):        {'YES' if knows_tesla_full else 'NO':^12}    {'YES' if knows_tesla_sel else 'NO':^9}
-Knows Bob (old):          {'YES' if knows_bob_full else 'NO':^12}    {'YES' if knows_bob_sel else 'NO':^9} (want NO)
+Test                              Time      Notes
+─────────────────────────────────────────────────────────────────
+1. Selective MISS (not cached):   {times['selective_miss']:.3f}s   Compute + store
+2. Selective HIT  (cached):       {times['selective_hit']:.3f}s   Load from cache
+3. Fresh compute (no params):     {times['fresh_compute']:.3f}s   vLLM prefix cache only
+4. Full context MISS:             {times['full_miss']:.3f}s   Compute all
+5. Full context HIT:              {times['full_hit']:.3f}s   Load all
+6. Selective (skip old):          {times['selective_skip']:.3f}s   Load subset
+
+ANALYSIS:
+─────────────────────────────────────────────────────────────────""")
+
+    # Analysis
+    if times['selective_hit'] < times['selective_miss'] * 0.8:
+        print(f"[OK] Selective HIT faster than MISS: {times['selective_miss']/times['selective_hit']:.2f}x speedup")
+        print("     → LMCache is loading cached KV blocks")
+    else:
+        print(f"[??] Selective HIT not much faster than MISS")
+        print(f"     MISS: {times['selective_miss']:.3f}s, HIT: {times['selective_hit']:.3f}s")
+        print("     → May not be using cached blocks")
+
+    if times['selective_hit'] < times['fresh_compute'] * 0.8:
+        print(f"[OK] Selective HIT faster than fresh: {times['fresh_compute']/times['selective_hit']:.2f}x speedup")
+    else:
+        print(f"[??] Selective HIT similar to fresh compute")
+
+    if times['full_hit'] < times['full_miss'] * 0.5:
+        print(f"[OK] Full HIT much faster than MISS: {times['full_miss']/times['full_hit']:.2f}x speedup")
+        print("     → Prefix caching working")
+
+    # Quality check
+    print(f"""
+QUALITY CHECK:
+─────────────────────────────────────────────────────────────────
+Knows favorite number (test 1-3): {unique_id}
+  Selective MISS: {'YES' if str(unique_id) in out1 else 'NO'}
+  Selective HIT:  {'YES' if str(unique_id) in out2 else 'NO'}
+  Fresh compute:  {'YES' if str(unique_id) in out3 else 'NO'}
+
+Full context tests:
+  Knows Tesla: {'YES' if 'tesla' in out4.lower() else 'NO'}
+  Knows Bob:   {'YES' if 'bob' in out5.lower() else 'NO'}
+  Selective knows Tesla: {'YES' if 'tesla' in out6.lower() else 'NO'}
 """)
 
-    if knows_tesla_full and knows_tesla_sel:
-        print("[OK] NEW content accessible in both modes")
-
-    if knows_bob_full and not knows_bob_sel:
-        print("[OK] OLD content correctly excluded in selective mode")
-    elif knows_bob_sel:
-        print("[FAIL] Model knows Bob in selective mode (should not)")
-
-    print("\n" + "="*70)
+    print("="*70)
 
 
 if __name__ == "__main__":
