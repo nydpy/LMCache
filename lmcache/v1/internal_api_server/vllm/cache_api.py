@@ -834,6 +834,76 @@ async def kvcache_record_slot(
         )
 
 
+@router.get("/cache/stored_hashes")
+async def get_stored_hashes(request: Request):
+    """Get block hashes from recent store events.
+
+    Returns the block hashes that were computed and stored during recent
+    cache store operations. These hashes can be used for selective loading.
+
+    NOTE: Requires enable_kv_events=true in LMCache config.
+
+    Args:
+        request (Request): The FastAPI request object containing application state.
+
+    Returns:
+        PlainTextResponse: A JSON response containing stored block hashes.
+
+    Example:
+        ```bash
+        curl -X GET "http://localhost:8000/cache/stored_hashes"
+        # Response: {
+        #   "status": "success",
+        #   "events": [
+        #     {"block_hashes": [12345, 67890], "token_ids": [...], "block_size": 256},
+        #     ...
+        #   ]
+        # }
+        ```
+    """
+    try:
+        lmcache_engine, error_response = _check_lmcache_engine(request)
+        if error_response:
+            return error_response
+
+        assert lmcache_engine is not None
+
+        # Get stored events (this clears the queue)
+        events = list(lmcache_engine.get_kv_events())
+
+        events_data = []
+        for event in events:
+            events_data.append({
+                "block_hashes": event.block_hashes,
+                "token_ids": event.token_ids,
+                "block_size": event.block_size,
+                "parent_block_hash": event.parent_block_hash,
+            })
+
+        response_data = {
+            "status": "success",
+            "num_events": len(events_data),
+            "events": events_data,
+        }
+
+        if not events_data:
+            response_data["message"] = (
+                "No events. Make sure enable_kv_events=true in LMCache config."
+            )
+
+        return PlainTextResponse(
+            content=json.dumps(response_data, indent=2),
+            media_type="application/json",
+        )
+
+    except Exception as e:
+        logger.error("Failed to get stored hashes: %s", str(e))
+        return _create_error_response(
+            {"error": "Failed to get stored hashes", "message": str(e)},
+            500,
+        )
+
+
 @router.get("/cache/kvcache/info")
 async def kvcache_info(request: Request):
     """Get information about the current kvcaches.
