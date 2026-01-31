@@ -51,7 +51,6 @@ llm = LLM(
     max_model_len=4096,
     gpu_memory_utilization=0.85,
     enable_prefix_caching=True,
-    quantization="awq",
 )
 print("Model ready!\n")
 
