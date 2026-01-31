@@ -182,6 +182,33 @@ def main():
         label="Request 4 (selective - ask about old)"
     )
 
+    print("\n" + "="*70)
+    print("TEST 5: FRESH COMPUTE (same 6 messages, NO selective params)")
+    print("="*70)
+
+    # Same messages as selective, but WITHOUT selective_hashes
+    # This forces fresh KV computation
+    selective_messages_fresh = selective_messages + [
+        {"role": "user", "content": "What car do I have?"}
+    ]
+    out5 = make_request(
+        client,
+        selective_messages_fresh,
+        selective_params=None,  # No selective loading - fresh compute
+        label="Request 5 (fresh compute - no cache)"
+    )
+
+    print("\n" + "="*70)
+    print("TEST 6: SELECTIVE AGAIN (should be faster if cache works)")
+    print("="*70)
+
+    out6 = make_request(
+        client,
+        selective_messages_q,
+        selective_params=selective_params,
+        label="Request 6 (selective - second time)"
+    )
+
     # Results
     print("\n" + "="*70)
     print("RESULTS")
